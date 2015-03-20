@@ -8,3 +8,5 @@
 erl_crash.dump
 /.eunit
 /.rebar
+*.iml
+/.idea

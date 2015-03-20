@@ -11,13 +11,23 @@
 
 -define(TIMER_MSG, '#delay').
 
+-record(
+  user_metric,
+  {
+    mfa :: {atom(), atom(), list()},
+    name :: list()
+  }
+).
+
 -record(state, {key :: string(),
                 sched_time :: enabled | disabled | unavailable,
                 prev_sched :: [{integer(), integer(), integer()}],
                 timer_ref :: reference(),
                 delay :: integer(), % milliseconds
                 prev_io :: {In::integer(), Out::integer()},
-                prev_gc :: {GCs::integer(), Words::integer(), 0}}).
+                prev_gc :: {GCs::integer(), Words::integer(), 0},
+                user_metrics :: [#user_metric{}],
+                report_ets :: boolean()}).
 %%% INTERFACE
 start_link() ->
     start_link(base_key()).
@@ -33,6 +43,8 @@ init(BaseKey) ->
     Ref = erlang:start_timer(Delay, self(), ?TIMER_MSG),
     {{input,In},{output,Out}} = erlang:statistics(io),
     PrevGC = erlang:statistics(garbage_collection),
+    UserMetrics = get_user_metrics(),
+    ReportEts = application:get_env(vmstats, report_ets, false),
     case {sched_time_available(), application:get_env(vmstats, sched_time)} of
         {true, {ok,true}} ->
             {ok, #state{key = [BaseKey,$.],
@@ -41,21 +53,27 @@ init(BaseKey) ->
                         sched_time = enabled,
                         prev_sched = lists:sort(erlang:statistics(scheduler_wall_time)),
                         prev_io = {In,Out},
-                        prev_gc = PrevGC}};
+                        prev_gc = PrevGC,
+                        user_metrics = UserMetrics,
+                        report_ets = ReportEts}};
         {true, _} ->
             {ok, #state{key = [BaseKey,$.],
                         timer_ref = Ref,
                         delay = Delay,
                         sched_time = disabled,
                         prev_io = {In,Out},
-                        prev_gc = PrevGC}};
+                        prev_gc = PrevGC,
+                        user_metrics = UserMetrics,
+                        report_ets = ReportEts}};
         {false, _} ->
             {ok, #state{key = [BaseKey,$.],
                         timer_ref = Ref,
                         delay = Delay,
                         sched_time = unavailable,
                         prev_io = {In,Out},
-                        prev_gc = PrevGC}}
+                        prev_gc = PrevGC,
+                        user_metrics = UserMetrics,
+                        report_ets = ReportEts}}
     end.
 
 handle_call(_Msg, _From, State) ->
@@ -64,7 +82,10 @@ handle_call(_Msg, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({timeout, R, ?TIMER_MSG}, S = #state{key=K, delay=D, timer_ref=R}) ->
+handle_info(
+    {timeout, R, ?TIMER_MSG},
+    S = #state{key=K, delay=D, timer_ref=R, report_ets = ReportEts}
+) ->
     %% Processes
     statsderl:gauge([K,"proc_count"], erlang:system_info(process_count), 1.00),
     statsderl:gauge([K,"proc_limit"], erlang:system_info(process_limit), 1.00),
@@ -115,6 +136,11 @@ handle_info({timeout, R, ?TIMER_MSG}, S = #state{key=K, delay=D, timer_ref=R}) -
     %% Reductions across the VM, excluding current time slice, already incremental
     {_, Reds} = erlang:statistics(reductions),
     statsderl:increment([K,"reductions"], Reds, 1.00),
+
+    %% ets statistics
+    report_ets(ReportEts, S),
+    %% user-defined statistics
+    report_user_metrics(S),
 
     %% Scheduler wall time
     #state{sched_time=Sched, prev_sched=PrevSched} = S,
@@ -175,3 +201,68 @@ base_key() ->
         {ok, V} -> V;
         undefined -> "vmstats"
     end.
+-spec get_user_metrics() -> [#user_metric{}].
+get_user_metrics() ->
+  case application:get_env(vmstats, user_metrics) of
+    undefined ->
+      [];
+    Metrics when is_list(Metrics)->
+      convert_metrics(Metrics)
+  end.
+
+-spec convert_metrics([]) -> [].
+convert_metrics([]) ->
+  [];
+convert_metrics([_|_] = MFAs) ->
+  convert_metrics(MFAs, []).
+
+%% Tail-recurcive conversion of user mertics to #user_metric{}
+-spec convert_metrics([], [#user_metric{}]) -> [#user_metric{}].
+convert_metrics([], AccIn)->
+  AccIn;
+convert_metrics([{{M, F, A}, Name}|T], AccIn)
+  when is_atom(M) andalso is_atom(F) andalso is_list(A) andalso is_list(Name)->
+  convert_metrics(T,[#user_metric{mfa = {M, F, A}, name = Name}|AccIn] );
+convert_metrics([MFA|T], AccIn)->
+  error_logger:warning_msg("vmstats: wrong format in User metric. Ignoring ~w", [MFA]),
+  convert_metrics(T,AccIn).
+
+report_user_metrics(#state{user_metrics = UserMetrics} = State) ->
+  report_user_metric(UserMetrics, State).
+
+report_user_metric([], #state{}) ->
+  ok;
+report_user_metric([#user_metric{mfa = {M, F, A}, name = Name}, T], #state{key = K} = State) ->
+  K2 = [K, "user."],
+  try erlang:apply(M,F,A) of
+    {ok, Value} when is_integer(Value) ->
+      statsderl:gauge([K2, Name], Value, 1.00);
+    Value when is_integer(Value)->
+      statsderl:gauge([K2, Name], Value, 1.00);
+    Ret->
+      error_logger:warning_msg("vmstats: MFA {~w,~w,~w}. Unexpected return ~w", [M,F,A, Ret])
+  catch
+    Class:Exception ->
+      error_logger:warning_msg("vmstats: MFA {~w,~w,~w}. Exception ~w:~w", [M,F,A, Class, Exception])
+  end,
+  report_user_metric(T, State).
+
+report_ets(true, S = #state{key = K}) ->
+  All = ets:all(),
+  K2 = [K, "ets_stats."],
+  statsderl:gauge([K2, "num_tables"], length(All), 1.00),
+  report_ets_tables(All, S#state{key = K2}),
+  ok;
+report_ets(_, _) ->
+  ok.
+
+report_ets_tables([], #state{}) ->
+  ok;
+report_ets_tables([Tid|T], S = #state{key = K}) when is_integer(Tid)->
+  K2 = [K, integer_to_list(Tid), "."],
+  report_ets_table(Tid, K2),
+  report_ets_tables(T, S).
+
+report_ets_table(Tid, K)->
+  statsderl:gauge([K, "size"], ets:info(Tid, size), 1.00),
+  statsderl:gauge([K, "memory"], ets:info(Tid, memory), 1.00).
